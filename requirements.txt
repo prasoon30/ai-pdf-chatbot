@@ -14,3 +14,4 @@ pypdf
 streamlit
 
 langchain-tavily
+tavily-python
