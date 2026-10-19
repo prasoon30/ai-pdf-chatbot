@@ -1,0 +1,438 @@
+import os
+import json
+from typing import TypedDict,Annotated
+from langgraph.graph.message import add_messages
+from dotenv import load_dotenv
+load_dotenv()
+
+from langgraph.graph import StateGraph, START, END
+from langchain_groq import ChatGroq
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from tavily import TavilyClient
+
+from langchain_chroma import Chroma
+
+
+embeddings = HuggingFaceEmbeddings(model_name = "sentence-transformers/all-MiniLM-L6-v2")
+
+
+def build_retriever(folder_path: str = "pdf_saver"):
+    documents = []
+
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".pdf"):
+            pdf_path = os.path.join(folder_path, filename)
+            loader = PyPDFLoader(pdf_path)
+            documents.extend(loader.load())
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=100
+    )
+
+    chunks = splitter.split_documents(documents)
+    
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory="./chroma_db"
+    )
+
+    return vectorstore.as_retriever(
+        search_kwargs={"k": 4}
+    )
+    
+    
+## llm
+llm = ChatGroq(model="openai/gpt-oss-20b",temperature=0.4)
+
+api_key = os.getenv("TAVILY_API_KEY")
+tavily_client = TavilyClient(api_key)
+
+
+# state
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    programme: str
+    query_type: str
+    retrieved_context: str
+    pdf_path: str
+    web_search_results: str
+    needs_web: bool
+    
+    
+    
+    
+    
+# Extract the summary 
+PDF_FOLDER = "pdf_saver"
+SUMMARY_FILE = "pdf_summaries.json"
+def load_pdf_summaries():
+    os.makedirs(PDF_FOLDER, exist_ok=True)
+
+    # Load previously generated summaries
+    if os.path.exists(SUMMARY_FILE):
+        with open(SUMMARY_FILE, "r", encoding="utf-8") as file:
+            summaries = json.load(file)
+    else:
+        summaries = []
+
+    # Index existing summaries by filename
+    summary_dict = {
+        item["filename"]: item
+        for item in summaries
+    }
+
+    # Process PDFs in the folder
+    for filename in os.listdir(PDF_FOLDER):
+        if not filename.lower().endswith(".pdf"):
+            continue
+
+        # Skip PDFs that already have summaries
+        if filename in summary_dict:
+            continue
+
+        pdf_path = os.path.join(PDF_FOLDER, filename)
+        print(f"Generating summary for: {filename}")
+
+        try:
+            loader = PyPDFLoader(pdf_path)
+            documents = loader.load()
+
+            pdf_text = "\n".join(
+                doc.page_content for doc in documents
+            )
+
+            if not pdf_text.strip():
+                print(f"No extractable text found in {filename}")
+                continue
+
+            # Limit input size to avoid excessively large prompts
+            pdf_text = pdf_text[:25000]
+
+            prompt = f"""
+You are a document summarization assistant.
+
+Summarize the following PDF for a chatbot that needs to
+identify which document can answer a user's question.
+
+Include:
+1. Document purpose and subject
+2. Main topics and chapters
+3. Important facts, rules, and requirements
+4. Important keywords users might use when asking questions
+
+Do not invent information. Use only the provided text.
+
+PDF filename: {filename}
+
+PDF content:
+{pdf_text}
+"""
+
+            response = llm.invoke(prompt)
+            summary = response.content.strip()
+
+            summary_dict[filename] = {
+                "filename": filename,
+                "summary": summary
+            }
+
+            # Save after each PDF, so completed summaries persist
+            with open(SUMMARY_FILE, "w", encoding="utf-8") as file:
+                json.dump(
+                    list(summary_dict.values()),
+                    file,
+                    indent=4,
+                    ensure_ascii=False
+                )
+
+            print(f"Summary saved for: {filename}")
+
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+
+    return list(summary_dict.values())
+
+
+# Generate summaries when the application starts
+pdf_summaries = load_pdf_summaries()
+    
+#   nodes
+
+# Classifier node
+def classifier_node(state: State) -> dict:
+    """Classify the query using uploaded PDF summaries."""
+
+    last_message = state["messages"][-1].content
+
+    # Get summaries of all uploaded PDFs
+    summaries_text = json.dumps(
+        pdf_summaries,
+        indent=2,
+        ensure_ascii=False
+    )
+
+    prompt = f"""
+You are a query classifier for a chatbot with three capabilities:
+1. Answer questions using uploaded PDFs.
+2. Search the web using Tavily.
+3. Answer general questions using an LLM.
+
+Here are the summaries of the uploaded PDFs:
+{summaries_text}
+
+Classify the user's query into exactly ONE category:
+
+PDF:
+- Choose "pdf" if the question can be answered using information
+  from any uploaded PDF.
+- Match the question against the PDF filenames and summaries.
+- Includes questions about topics, definitions, rules, facts,
+  chapters, examples, or details contained in uploaded documents.
+- Follow-up questions about previously discussed PDF content
+  should also use "pdf".
+- If multiple PDFs are relevant, choose "pdf". Retrieval can
+  search across all uploaded PDFs.
+
+WEB:
+- Choose "web" if the user explicitly requests online research,
+  current information, recent news, or information that needs
+  external web verification.
+- Examples: latest AI news, recent research papers, current prices.
+
+GENERAL:
+- Choose "general" for greetings, casual conversation,
+  coding help, and self-contained questions unrelated to
+  uploaded PDFs or current external information.
+
+Rules:
+- Prefer "pdf" when the query matches an uploaded PDF summary.
+- Prefer "web" when the user explicitly asks to search online.
+- Return only one category word.
+
+User query:
+{last_message}
+
+Category:
+"""
+
+    response = llm.invoke(prompt)
+    query_type = response.content.strip().lower()
+
+    # Validate the classifier output
+    if query_type not in ["pdf", "web", "general"]:
+        query_type = "general"
+
+    return {"query_type": query_type}
+
+
+
+def web_search_node(state: State) -> dict:
+    """Search the web using Tavily."""
+
+    query = state["messages"][-1].content
+
+    response = tavily_client.search(
+        query=query,
+        search_depth="basic",
+        max_results=5
+    )
+
+    results = []
+
+    for item in response.get("results", []):
+        results.append(
+            f"Title: {item.get('title', '')}\n"
+            f"URL: {item.get('url', '')}\n"
+            f"Content: {item.get('content', '')}"
+        )
+
+    return {
+        "web_search_results": "\n\n".join(results)
+    }
+
+
+
+def pdf_rag_node(state: State) -> dict:
+    """Retrieve PDF context and check whether web fallback is needed."""
+
+    query = state["messages"][-1].content
+
+    retriever = build_retriever()
+    documents = retriever.invoke(query)
+
+    if not documents:
+        return {
+            "retrieved_context": "",
+            "web_search_results": "",
+            "needs_web": True
+        }
+
+    context_parts = []
+
+    for doc in documents:
+        source = os.path.basename(
+            doc.metadata.get("source", "Unknown document")
+        )
+        page = doc.metadata.get("page", "Unknown")
+
+        context_parts.append(
+            f"Source: {source}\n"
+            f"Page: {page}\n"
+            f"Content:\n{doc.page_content}"
+        )
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    check_prompt = f"""
+You are checking whether retrieved PDF information is sufficient
+to answer a user's question.
+
+Question:
+{query}
+
+Retrieved PDF context:
+{context}
+
+Return YES if the context contains enough relevant information
+to answer the question accurately.
+
+Return NO if the context is missing important details,
+does not answer the question, or is insufficient.
+
+Return only YES or NO.
+"""
+
+    result = llm.invoke(check_prompt).content.strip().upper()
+    needs_web = not result.startswith("YES")
+
+    return {
+        "retrieved_context": context,
+        "web_search_results": "",
+        "needs_web": needs_web
+    }
+
+
+
+
+def general_node(state: State) -> dict:
+    """Marks the query as general, without retrieval."""
+    return {
+        "retrieved_context": "NO_RETRIEVAL_NEEDED",
+        "web_search_results": ""
+    }
+
+
+def response_node(state: State) -> dict:
+    """Answer using PDF context, web results, or general knowledge."""
+
+    query = state["messages"][-1].content
+    programme = state.get("programme", "Unknown")
+    context = state.get("retrieved_context", "")
+    web_results = state.get("web_search_results", "")
+
+    if context.strip() or web_results.strip():
+        prompt = f"""
+You are a helpful AI assistant for a student in {programme}.
+
+User question:
+{query}
+
+PDF context:
+{context if context.strip() else "No relevant PDF context available."}
+
+Web search results:
+{web_results if web_results.strip() else "No web results available."}
+
+Instructions:
+- Use relevant PDF information first when available.
+- Use web results to fill gaps in the PDF information.
+- Clearly distinguish information from the PDFs and the web.
+- Do not invent facts or citations.
+- Include relevant source URLs from web results.
+- If neither source provides enough evidence, say so.
+- Give a clear, accurate, well-structured answer.
+"""
+    else:
+        prompt = f"""
+You are a friendly AI assistant helping a student in {programme}.
+
+Answer this question using your general knowledge:
+{query}
+
+Be clear, accurate, and conversational. Be transparent
+if the question requires information you cannot verify.
+"""
+
+    response = llm.invoke(prompt)
+
+    return {
+        "messages": [("ai", response.content.strip())]
+    }
+
+
+## router function
+def route_query(state: State) :
+    if state['query_type'] == 'pdf':
+        return "pdf_rag"
+    elif state['query_type'] == 'web':
+        return "web"
+    else:
+        return "general"
+
+
+def route_after_pdf(state: State):
+    """Route to web search if the PDF context is insufficient."""
+    if state.get("needs_web", False):
+        return "web"
+    return "response"
+    
+
+
+# Build the graph
+graph = StateGraph(State)
+
+# Add nodes
+graph.add_node("classifier", classifier_node)
+graph.add_node("pdf_rag", pdf_rag_node)
+graph.add_node("web", web_search_node)
+graph.add_node("general", general_node)
+graph.add_node("response", response_node)
+
+# Start with classification
+graph.add_edge(START, "classifier")
+
+# Route initial query
+graph.add_conditional_edges(
+    "classifier",
+    route_query,
+    {
+        "pdf_rag": "pdf_rag",
+        "web": "web",
+        "general": "general"
+    }
+)
+
+# If PDF context is insufficient, search the web
+graph.add_conditional_edges(
+    "pdf_rag",
+    route_after_pdf,
+    {
+        "web": "web",
+        "response": "response"
+    }
+)
+
+# All paths generate a final answer
+graph.add_edge("web", "response")
+graph.add_edge("general", "response")
+graph.add_edge("response", END)
+
+# Compile
+app = graph.compile()
+
